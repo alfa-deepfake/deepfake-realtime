@@ -1,0 +1,37 @@
+# Thin runtime for the realtime deepfake services (AlphaFace + seed-vc + whisper).
+#
+# Deliberately contains NO Python packages: each service runs the venv that
+# already exists on the host under /home/master, mounted 1:1 at the same
+# absolute path. Those venvs pin mutually incompatible torch builds — AlphaFace
+# needs 2.6.0+cu124, seed-vc needs 2.4.0+cu124 — so baking either one into a
+# shared image is not possible. This image only supplies the interpreter the
+# venvs symlink to (/usr/bin/python3.12) plus the system libs they dlopen.
+#
+# Ubuntu 24.04 matches the host: same glibc, same Python 3.12.3. That match is
+# what makes the mounted venvs runnable as-is.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# python3      - the 3.12 interpreter the venvs symlink to
+# ffmpeg       - audio decode for seed-vc / whisper
+# libsndfile1  - librosa / soundfile backend
+# libgl1,
+# libglib2.0-0 - OpenCV runtime deps (AlphaFace)
+# libgomp1     - OpenMP, used by onnxruntime and torch
+# curl         - healthchecks only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 \
+      ffmpeg \
+      libsndfile1 \
+      libgl1 \
+      libglib2.0-0 \
+      libgomp1 \
+      ca-certificates \
+      curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# CUDA comes from the nvidia container runtime plus the wheels inside each
+# mounted venv, not from this image.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility

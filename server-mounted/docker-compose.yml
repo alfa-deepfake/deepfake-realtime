@@ -1,0 +1,116 @@
+# Realtime deepfake services on the A100 box (master@62.183.4.208, ssh port 22010).
+#
+# Replaces starting each service by hand:
+#   ~/launch_alphaface.sh
+#   cd ~/seed-vc && ./venv/bin/python vc_server.py --host 127.0.0.1 --port 17494
+#
+# with a single:
+#   docker compose up -d
+#
+#   alphaface  127.0.0.1:8001    face swap over aiohttp/WebSocket
+#   seed-vc    127.0.0.1:17494   realtime voice conversion
+#
+# Both checkouts now live next to this file, under STACK_DIR:
+#   deepfake-realtime/Alphaface_Official   (2.1 GB, upstream clone + weights)
+#   deepfake-realtime/seed-vc              (11 GB, upstream clone + checkpoints)
+#   deepfake-realtime/rt_alphaface_server.py
+#
+# The old locations (~/seed-vc, ~/Alphaface_Official) are kept as symlinks:
+# venv shebangs inside seed-vc hardcode /home/master/seed-vc/venv/bin/python3,
+# and the bench/ scripts reference the old paths too.
+#
+# The application code is not modified. Two consequences worth understanding:
+#
+# 1. network_mode: host is required, not a shortcut. All three servers bind
+#    127.0.0.1 in their own source (rt_alphaface_server.py hardcodes it at
+#    line 524; the others default to it). On a bridge network that loopback
+#    bind would be the CONTAINER's loopback, so published ports would reach
+#    nothing. Host networking keeps the bind exactly where the existing SSH
+#    tunnels expect it — `ssh -p 22010 -L 8001:127.0.0.1:8001 -N master@...` —
+#    so the deepface-bridge client keeps working untouched.
+#
+# 2. The venvs and weights are mounted from the host, never copied into the
+#    image. seed-vc pins torch 2.4.0+cu124 and AlphaFace pins torch 2.6.0+cu124
+#    — mutually incompatible, so a single shared image is impossible. Roughly
+#    6 GB of weights (alphaface_demo.pt, seed-vc checkpoints, facefusion and
+#    VisoMaster ONNX) live outside git too. Mounting /home/master 1:1 at the
+#    same absolute path is what lets each venv's shebangs and the hardcoded
+#    ALPHA_DIR / FF_MODELS / VM_MODELS paths resolve unchanged.
+#
+# BEFORE THE FIRST `up`: stop the hand-started processes, or the ports are
+# still taken and the containers cannot bind:
+#   pkill -f rt_alphaface_server.py; pkill -f vc_server.py
+
+x-realtime: &realtime
+  build:
+    context: .
+    dockerfile: Dockerfile.realtime
+  image: alfa-realtime:24.04
+  # master(1001:1001) — so recordings, references and *.log written into the
+  # mounted home keep the host owner instead of turning up as root.
+  user: "${SERVICE_UID:-1001}:${SERVICE_GID:-1001}"
+  network_mode: host
+  restart: unless-stopped
+  volumes:
+    - "${MASTER_HOME:-/home/master}:${MASTER_HOME:-/home/master}"
+  environment:
+    # Without HOME the venvs fall back to / and the matplotlib / HuggingFace
+    # cache writes fail with permission errors.
+    HOME: "${MASTER_HOME:-/home/master}"
+    NVIDIA_VISIBLE_DEVICES: all
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+
+services:
+  # Replaces ~/launch_alphaface.sh. Must run with Alphaface_Official as cwd: the
+  # server chdirs and patches sys.path to import Models.Swapper_AlphaFace, and
+  # reads its mask/enhancer ONNX models from facefusion/.assets/models and
+  # VisoMaster/model_assets (both still under $HOME, outside this stack).
+  alphaface:
+    <<: *realtime
+    container_name: alfa-alphaface
+    working_dir: "${STACK_DIR:-/home/master/deepfake-realtime}/Alphaface_Official"
+    command:
+      - "${MASTER_HOME:-/home/master}/codex_ffhq_realtime_pilot/venv/bin/python"
+      - "${STACK_DIR:-/home/master/deepfake-realtime}/rt_alphaface_server.py"
+    # The 64 MB default shm is not enough for torch IPC under load.
+    shm_size: "8gb"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s   # ~2 GB of weights; the first load is slow
+
+  # seed-vc realtime voice conversion. vc_server.py loads real-time-gui.py by
+  # file path from its own directory, so cwd must be the seed-vc checkout.
+  seed-vc:
+    <<: *realtime
+    container_name: alfa-seed-vc
+    working_dir: "${STACK_DIR:-/home/master/deepfake-realtime}/seed-vc"
+    command:
+      - "./venv/bin/python"
+      - "vc_server.py"
+      - "--host"
+      - "${VC_HOST:-127.0.0.1}"
+      - "--port"
+      - "${VC_PORT:-17494}"
+    shm_size: "8gb"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${VC_PORT:-17494}/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+# whisper_server.py (faster-whisper ASR, port 9000) is intentionally NOT a
+# service here. Nothing references it: not vc_index.html, not vc_server.py, not
+# rt_alphaface_server.py, not the deepface-bridge client. It only burned GPU
+# memory. The script still sits in seed-vc/ if it is ever needed again:
+#   cd deepfake-realtime/seed-vc && ./venv/bin/python whisper_server.py --host 127.0.0.1 --port 9000

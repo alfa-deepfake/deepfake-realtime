@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Realtime Voice Conversion — seed-vc</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0f1115; color:#e6e8ee; font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .wrap { max-width:640px; margin:0 auto; padding:32px 20px 64px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:#8b90a0; font-size:13px; margin:0 0 28px; }
+  .card { background:#171a21; border:1px solid #262a35; border-radius:12px; padding:18px; margin-bottom:16px; }
+  .step { font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:#7d8296; margin:0 0 12px; }
+  button { font:inherit; border:0; border-radius:8px; padding:10px 18px; cursor:pointer; background:#2f6df6; color:#fff; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  button.rec { background:#e5484d; }
+  input[type=file] { font:inherit; color:#b9bdcc; max-width:100%; }
+  .ok { color:#4ec77f; } .err { color:#ff6b6b; } .muted { color:#8b90a0; }
+  #status { min-height:20px; font-size:13px; margin-top:10px; }
+  audio { width:100%; margin-top:12px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#e5484d; margin-right:7px; vertical-align:middle; animation:p 1s infinite; }
+  @keyframes p { 50% { opacity:.25 } }
+  .note { font-size:12px; color:#7d8296; margin-top:10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Realtime Voice Conversion</h1>
+  <p class="sub">seed-vc · zero-shot · A100</p>
+
+  <div class="card">
+    <p class="step">Шаг 1 — референсный голос</p>
+    <input type="file" id="ref" accept="audio/*">
+    <button id="upload">Загрузить</button>
+    <div id="refStatus" class="muted" style="font-size:13px;margin-top:10px">10–30 секунд чистой речи, без музыки и шума.</div>
+  </div>
+
+  <div class="card">
+    <p class="step">Шаг 2 — запись</p>
+    <button id="rec" class="rec" disabled>● Начать запись</button>
+    <div id="status"></div>
+    <p class="note">Свой изменённый голос вы не услышите во время записи — он пишется на сервере. Плеер появится после остановки.</p>
+  </div>
+
+  <div class="card" id="playCard" style="display:none">
+    <p class="step">Шаг 3 — результат</p>
+    <audio id="player" controls></audio>
+    <div style="margin-top:10px"><a id="dl" class="muted" style="font-size:13px" download>Скачать WAV</a></div>
+  </div>
+</div>
+
+<script>
+let refId = null, ws = null, ctx = null, node = null, stream = null, recording = false;
+const $ = id => document.getElementById(id);
+const setStatus = (html, cls) => { $("status").className = cls || ""; $("status").innerHTML = html; };
+
+$("upload").onclick = async () => {
+  const f = $("ref").files[0];
+  if (!f) { $("refStatus").className = "err"; $("refStatus").textContent = "Выберите файл."; return; }
+  $("refStatus").className = "muted"; $("refStatus").textContent = "Загрузка…";
+  const fd = new FormData(); fd.append("file", f);
+  const r = await fetch("/reference", { method: "POST", body: fd });
+  const j = await r.json();
+  if (!r.ok) { $("refStatus").className = "err"; $("refStatus").textContent = j.error; return; }
+  refId = j.id;
+  $("refStatus").className = "ok";
+  $("refStatus").textContent = `Референс принят (${j.duration} с). Можно записывать.`;
+  $("rec").disabled = false;
+};
+
+async function start() {
+  setStatus("Подключение…");
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+  });
+  ctx = new AudioContext({ sampleRate: 48000 });
+  await ctx.audioWorklet.addModule("data:text/javascript," + encodeURIComponent(`
+    class Tap extends AudioWorkletProcessor {
+      process(inputs) {
+        const ch = inputs[0][0];
+        if (ch) this.port.postMessage(new Float32Array(ch));
+        return true;
+      }
+    }
+    registerProcessor("tap", Tap);
+  `));
+
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?ref=${refId}`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "ready") {
+      setStatus('<span class="dot"></span>Идёт запись…');
+      const src = ctx.createMediaStreamSource(stream);
+      node = new AudioWorkletNode(ctx, "tap");
+      // Deliberately not connected to ctx.destination: no self-monitoring.
+      node.port.onmessage = e => { if (ws && ws.readyState === 1) ws.send(e.data.buffer); };
+      src.connect(node);
+      recording = true;
+      $("rec").textContent = "■ Остановить";
+      $("rec").disabled = false;
+    } else if (m.type === "recording") {
+      $("player").src = m.url; $("dl").href = m.url;
+      $("playCard").style.display = "";
+      setStatus("Готово — запись ниже.", "ok");
+      $("rec").textContent = "● Начать запись";
+      $("rec").disabled = false;
+    } else if (m.type === "error") {
+      setStatus("Ошибка: " + m.message, "err");
+      cleanup(); $("rec").textContent = "● Начать запись"; $("rec").disabled = false;
+    }
+  };
+  ws.onerror = () => { setStatus("Ошибка соединения.", "err"); cleanup(); $("rec").disabled = false; };
+}
+
+function cleanup() {
+  recording = false;
+  if (node) { node.disconnect(); node = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (ctx) { ctx.close(); ctx = null; }
+}
+
+$("rec").onclick = async () => {
+  $("rec").disabled = true;
+  if (!recording) {
+    $("playCard").style.display = "none";
+    try { await start(); } catch (e) { setStatus("Не удалось начать: " + e.message, "err"); $("rec").disabled = false; }
+  } else {
+    setStatus("Финализация…");
+    if (ws && ws.readyState === 1) ws.send("stop");
+    cleanup();
+  }
+};
+</script>
+</body>
+</html>

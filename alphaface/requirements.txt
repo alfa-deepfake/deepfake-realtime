@@ -1,0 +1,31 @@
+# Pinned to what actually runs on the A100 box.
+#
+# torch 2.6.0+cu124 is NOT interchangeable here: the pip default (cu13x) makes
+# onnxruntime-gpu fail with CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH, because
+# both libraries share one process and torch is imported first — it is torch's
+# bundled cudnn 9.1 that ORT ends up using.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+# AlphaFace model code (Models/Swapper_AlphaFace.py) imports these directly.
+pytorch-lightning==2.6.5
+omegaconf==2.3.1
+
+# Face detect/align + the ONNX mask & restore models.
+insightface==0.7.3
+onnxruntime-gpu==1.23.2
+# 4.10.x is the last line that still builds against numpy 1.x — 4.12 requires
+# numpy>=2, which insightface and the pinned torch cannot use.
+opencv-python-headless==4.10.0.84
+scikit-image==0.26.0
+easydict==1.13
+
+# numpy must stay <2: insightface 0.7.3 and the pinned torch build are both
+# compiled against the 1.x ABI.
+numpy==1.26.4
+
+aiohttp==3.14.1
+
+# Fetches the two AlphaFace checkpoints from Google Drive at first start.
+gdown==6.1.0

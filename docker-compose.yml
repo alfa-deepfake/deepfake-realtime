@@ -1,0 +1,98 @@
+# Portable realtime deepfake stack: AlphaFace (video) + seed-vc (voice).
+#
+# Self-contained — clone this folder onto any Linux box with an NVIDIA GPU and:
+#
+#   docker compose up -d --build
+#
+# Nothing else to install and nothing to copy: the images build their own
+# Python environments, clone the upstream model code, and download every weight
+# on first start into named volumes.
+#
+#   alphaface  -> http://localhost:8001
+#   seed-vc    -> http://localhost:17494
+#
+# First run takes a while — roughly 15 GB of images plus ~7 GB of weights:
+#   alphaface  ~2 GB checkpoints (Google Drive) + ~810 MB ONNX + ~300 MB insightface
+#   seed-vc    ~4.4 GB from HuggingFace
+# Later runs reuse the volumes and start in seconds.
+#
+# Requirements on the host:
+#   - NVIDIA driver + nvidia-container-toolkit (`docker info | grep nvidia`)
+#   - ~10 GB VRAM for both services together
+#   - Docker Compose v2+
+#
+# Ports bind to 127.0.0.1 only. To reach them from another machine, use an SSH
+# tunnel rather than exposing them — these services have no authentication:
+#   ssh -L 8001:127.0.0.1:8001 -L 17494:127.0.0.1:17494 -N user@host
+
+services:
+  alphaface:
+    build:
+      context: ./alphaface
+    image: deepfake-realtime/alphaface:latest
+    container_name: alphaface
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${ALPHAFACE_PORT:-8001}:8001"
+    volumes:
+      # Checkpoints, ONNX models and the insightface cache. Survives rebuilds —
+      # delete this volume and the ~2.5 GB download happens again.
+      - alphaface-models:/models
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8001"
+      # Override if Google Drive rate-limits the default checkpoint IDs.
+      ALPHAFACE_DEMO_GDRIVE_ID: "${ALPHAFACE_DEMO_GDRIVE_ID:-18ZOQB3WmIFnMwi1GqBroFFEOuSNKWpZQ}"
+      ARCFACE_GDRIVE_ID: "${ARCFACE_GDRIVE_ID:-1qc4s6eRQPluma72WFibUnw74GPMAYRtY}"
+    # torch IPC needs more than the 64 MB default.
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Generous: the first start downloads ~2.5 GB before it can bind.
+      start_period: 900s
+
+  seed-vc:
+    build:
+      context: ./seed-vc
+    image: deepfake-realtime/seed-vc:latest
+    container_name: seed-vc
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${SEEDVC_PORT:-17494}:17494"
+    volumes:
+      # HuggingFace cache + seed-vc checkpoints (~4.4 GB).
+      - seedvc-models:/models
+      # Converted audio is written here; bind-mounted so it outlives the container.
+      - ./data/recordings:/app/recordings
+      - ./data/references:/app/references
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "17494"
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:17494/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 900s
+
+volumes:
+  alphaface-models:
+  seedvc-models:
